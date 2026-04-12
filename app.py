@@ -11,8 +11,8 @@ from PIL import Image as PILImage
 
 app = Flask(__name__)
 
-IMG_PX = 56
-ROW_PT = IMG_PX * 0.75
+IMG_PX = 52
+ROW_PT = 42
 
 def header_style(cell):
     cell.font      = Font(name="Arial", bold=True, color="FFFFFF", size=10)
