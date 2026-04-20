@@ -1,5 +1,5 @@
-from flask import Flask, request, jsonify
-import base64, io, os
+from flask import Flask, request, jsonify, send_file
+import base64, io, os, uuid, time, threading
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.drawing.spreadsheet_drawing import OneCellAnchor, AnchorMarker
@@ -13,6 +13,24 @@ app = Flask(__name__)
 
 IMG_PX = 52
 ROW_PT = 42
+
+# Geçici dosya deposu: { token: { "path": ..., "filename": ..., "created_at": ... } }
+_file_store = {}
+_store_lock = threading.Lock()
+TEMP_DIR = "/tmp/excel_files"
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+def _cleanup_old_files(max_age_seconds=600):
+    """10 dakikadan eski geçici dosyaları sil"""
+    now = time.time()
+    with _store_lock:
+        expired = [t for t, v in _file_store.items() if now - v["created_at"] > max_age_seconds]
+        for token in expired:
+            try:
+                os.remove(_file_store[token]["path"])
+            except Exception:
+                pass
+            del _file_store[token]
 
 def header_style(cell):
     cell.font      = Font(name="Arial", bold=True, color="FFFFFF", size=10)
@@ -48,16 +66,8 @@ COLUMNS = [
     ("Lokasyon",   "location", 16),
 ]
 
-@app.route("/generate-excel", methods=["POST"])
-def generate_excel():
-    body = request.get_json(force=True, silent=True)
-    if not body or "data" not in body:
-        return jsonify({"error": "JSON body eksik"}), 400
-
-    rows = [r for r in body["data"] if any(str(v).strip() for k, v in r.items() if k != "image_base64")]
-    if not rows:
-        return jsonify({"error": "data listesi bos"}), 400
-
+def build_workbook(rows):
+    """Ortak workbook oluşturma fonksiyonu"""
     wb = Workbook()
     ws = wb.active
     ws.title = "Satis Raporu"
@@ -96,7 +106,26 @@ def generate_excel():
     ws.freeze_panes = "A2"
     last_col = get_column_letter(len(COLUMNS))
     ws.auto_filter.ref = f"A1:{last_col}1"
+    return wb
 
+def parse_and_validate(request):
+    body = request.get_json(force=True, silent=True)
+    if not body or "data" not in body:
+        return None, None
+    rows = [r for r in body["data"] if any(str(v).strip() for k, v in r.items() if k != "image_base64")]
+    return body, rows
+
+
+# ── Mevcut endpoint (FM desktop için — base64 döndürür) ──────────────────────
+@app.route("/generate-excel", methods=["POST"])
+def generate_excel():
+    body, rows = parse_and_validate(request)
+    if body is None:
+        return jsonify({"error": "JSON body eksik"}), 400
+    if not rows:
+        return jsonify({"error": "data listesi bos"}), 400
+
+    wb = build_workbook(rows)
     out = io.BytesIO()
     wb.save(out)
     out.seek(0)
@@ -104,9 +133,63 @@ def generate_excel():
 
     return jsonify({"status": "ok", "rows": len(rows), "excel_b64": encoded})
 
+
+# ── Yeni endpoint (WebDirect için — download URL döndürür) ───────────────────
+@app.route("/generate-excel-file", methods=["POST"])
+def generate_excel_file():
+    _cleanup_old_files()
+
+    body, rows = parse_and_validate(request)
+    if body is None:
+        return jsonify({"error": "JSON body eksik"}), 400
+    if not rows:
+        return jsonify({"error": "data listesi bos"}), 400
+
+    wb = build_workbook(rows)
+
+    token = uuid.uuid4().hex
+    filename = f"satis_raporu_{token[:8]}.xlsx"
+    filepath = os.path.join(TEMP_DIR, filename)
+
+    wb.save(filepath)
+
+    with _store_lock:
+        _file_store[token] = {
+            "path": filepath,
+            "filename": filename,
+            "created_at": time.time()
+        }
+
+    return jsonify({
+        "status": "ok",
+        "rows": len(rows),
+        "download_token": token,
+        "download_url": f"/download/{token}"
+    })
+
+
+# ── Download endpoint ────────────────────────────────────────────────────────
+@app.route("/download/<token>", methods=["GET"])
+def download_file(token):
+    with _store_lock:
+        entry = _file_store.get(token)
+
+    if not entry or not os.path.exists(entry["path"]):
+        return jsonify({"error": "Dosya bulunamadi veya suresi doldu"}), 404
+
+    return send_file(
+        entry["path"],
+        as_attachment=True,
+        download_name=entry["filename"],
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+
+# ── Health ───────────────────────────────────────────────────────────────────
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
