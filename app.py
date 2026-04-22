@@ -125,28 +125,64 @@ def generate_excel():
     if not rows:
         return jsonify({"error": "data listesi bos"}), 400
 
-    try:
-        wb = build_workbook(rows)
-        out = io.BytesIO()
-        wb.save(out)
-        out.seek(0)
-        
-        encoded = base64.b64encode(out.read()).decode("utf-8")
-        
-        return jsonify({
-            "status": "ok",
-            "rows": len(rows),
-            "excel_b64": encoded,
-            "filename": "satis_raporu.xlsx"
-        })
-    except Exception as e:
-        return jsonify({"error": f"Excel oluşturma hatası: {str(e)}"}), 500
+    wb = build_workbook(rows)
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    encoded = base64.b64encode(out.read()).decode("utf-8")
+
+    return jsonify({"status": "ok", "rows": len(rows), "excel_b64": encoded})
+
 
 # ── Yeni endpoint (WebDirect için — download URL döndürür) ───────────────────
+@app.route("/generate-excel-file", methods=["POST"])
+def generate_excel_file():
+    _cleanup_old_files()
+
+    body, rows = parse_and_validate(request)
+    if body is None:
+        return jsonify({"error": "JSON body eksik"}), 400
+    if not rows:
+        return jsonify({"error": "data listesi bos"}), 400
+
+    wb = build_workbook(rows)
+
+    token = uuid.uuid4().hex
+    filename = f"satis_raporu_{token[:8]}.xlsx"
+    filepath = os.path.join(TEMP_DIR, filename)
+
+    wb.save(filepath)
+
+    with _store_lock:
+        _file_store[token] = {
+            "path": filepath,
+            "filename": filename,
+            "created_at": time.time()
+        }
+
+    return jsonify({
+        "status": "ok",
+        "rows": len(rows),
+        "download_token": token,
+        "download_url": f"/download/{token}"
+    })
 
 
+# ── Download endpoint ────────────────────────────────────────────────────────
+@app.route("/download/<token>", methods=["GET"])
+def download_file(token):
+    with _store_lock:
+        entry = _file_store.get(token)
 
+    if not entry or not os.path.exists(entry["path"]):
+        return jsonify({"error": "Dosya bulunamadi veya suresi doldu"}), 404
 
+    return send_file(
+        entry["path"],
+        as_attachment=True,
+        download_name=entry["filename"],
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
 
 # ── Health ───────────────────────────────────────────────────────────────────
