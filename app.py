@@ -8,6 +8,7 @@ from openpyxl.utils.units import pixels_to_EMU
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from PIL import Image as PILImage
+from datetime import datetime
 
 app = Flask(__name__)
 
@@ -146,9 +147,12 @@ def generate_excel_file():
         return jsonify({"error": "data listesi bos"}), 400
 
     wb = build_workbook(rows)
+    
 
-    token = uuid.uuid4().hex
-    filename = f"satis_raporu_{token[:8]}.xlsx"
+    
+    token = uuid.uuid4().hex[:6]
+    tarih = datetime.now().strftime("%Y-%m-%d")
+    filename = f"satis_raporu_{tarih}_{token}.xlsx"
     filepath = os.path.join(TEMP_DIR, filename)
 
     wb.save(filepath)
