@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, send_file
 import base64, io, os, uuid, time, threading
+from datetime import datetime
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.drawing.spreadsheet_drawing import OneCellAnchor, AnchorMarker
@@ -8,21 +9,21 @@ from openpyxl.utils.units import pixels_to_EMU
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from PIL import Image as PILImage
-from datetime import datetime
 
 app = Flask(__name__)
 
+API_KEY  = os.environ.get("API_KEY", "")
+TMP_DIR  = "/tmp/excel_files"
+os.makedirs(TMP_DIR, exist_ok=True)
+
 IMG_PX = 52
 ROW_PT = 42
+DARK   = "1F2D4E"
 
-# Geçici dosya deposu: { token: { "path": ..., "filename": ..., "created_at": ... } }
 _file_store = {}
 _store_lock = threading.Lock()
-TEMP_DIR = "/tmp/excel_files"
-os.makedirs(TEMP_DIR, exist_ok=True)
 
 def _cleanup_old_files(max_age_seconds=600):
-    """10 dakikadan eski geçici dosyaları sil"""
     now = time.time()
     with _store_lock:
         expired = [t for t, v in _file_store.items() if now - v["created_at"] > max_age_seconds]
@@ -33,9 +34,16 @@ def _cleanup_old_files(max_age_seconds=600):
                 pass
             del _file_store[token]
 
+def check_api_key():
+    if not API_KEY:
+        return False, "Sunucuda API_KEY tanimlanmamis"
+    if request.headers.get("X-API-Key") != API_KEY:
+        return False, "Yetkisiz erisim"
+    return True, None
+
 def header_style(cell):
     cell.font      = Font(name="Arial", bold=True, color="FFFFFF", size=10)
-    cell.fill      = PatternFill("solid", start_color="1F2D4E")
+    cell.fill      = PatternFill("solid", start_color=DARK)
     cell.alignment = Alignment(horizontal="center", vertical="center")
     s = Side(style="thin", color="FFFFFF")
     cell.border    = Border(left=s, right=s, bottom=s)
@@ -47,28 +55,43 @@ def row_style(cell, row_no):
     s = Side(style="thin", color="D0D7E3")
     cell.border    = Border(left=s, right=s, top=s, bottom=s)
 
-def resize_b64_image(b64_str, max_px=56):
+def total_style(cell):
+    cell.font      = Font(name="Arial", bold=True, size=10, color=DARK)
+    cell.fill      = PatternFill("solid", start_color="E8ECF4")
+    cell.alignment = Alignment(horizontal="center", vertical="center")
+    s = Side(style="medium", color=DARK)
+    cell.border    = Border(left=s, right=s, top=s, bottom=s)
+
+def place_image(ws, b64_str, col, row, px):
     raw = base64.b64decode(b64_str)
-    img = PILImage.open(io.BytesIO(raw)).convert("RGB")
-    img.thumbnail((max_px, max_px), PILImage.LANCZOS)
+    pil = PILImage.open(io.BytesIO(raw)).convert("RGB")
+    pil.thumbnail((px, px), PILImage.LANCZOS)
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=85)
+    pil.save(buf, format="JPEG", quality=85)
     buf.seek(0)
-    return buf
+    xl = XLImage(buf)
+    xl.width  = pil.width
+    xl.height = pil.height
+    offset = pixels_to_EMU(2)
+    size   = XDRPositiveSize2D(pixels_to_EMU(pil.width), pixels_to_EMU(pil.height))
+    marker = AnchorMarker(col=col-1, colOff=offset, row=row-1, rowOff=offset)
+    xl.anchor = OneCellAnchor(_from=marker, ext=size)
+    ws.add_image(xl)
 
 COLUMNS = [
-    ("Resim",      None,        8),
-    ("Urun ID",    "prdID",    14),
-    ("Kalem ID",   "itmID",    14),
-    ("Etiket",     "tagPrice", 12),
-    ("Satis",      "salePrice",12),
-    ("Indirim %",  "discount", 10),
-    ("Tarih",      "date",     14),
-    ("Lokasyon",   "location", 16),
+    ("Resim",      None,          8),
+    ("Urun ID",    "prdID",      14),
+    ("Kalem ID",   "itmID",      14),
+    ("Etiket",     "tagPrice",   14),
+    ("Satis",      "salePrice",  14),
+    ("Indirim %",  "discount",   12),
+    ("Tarih",      "date",       14),
+    ("Lokasyon",   "location",   16),
 ]
 
+TOTAL_KEYS = ["tagPrice", "salePrice"]
+
 def build_workbook(rows):
-    """Ortak workbook oluşturma fonksiyonu"""
     wb = Workbook()
     ws = wb.active
     ws.title = "Satis Raporu"
@@ -79,7 +102,10 @@ def build_workbook(rows):
         header_style(cell)
     ws.row_dimensions[1].height = 22
 
-    for row_no, item in enumerate(rows, start=2):
+    totals = {k: 0.0 for k in TOTAL_KEYS}
+
+    for idx, item in enumerate(rows):
+        row_no = idx + 2
         ws.row_dimensions[row_no].height = ROW_PT
 
         for col_no, (_, key, _) in enumerate(COLUMNS, start=1):
@@ -87,46 +113,80 @@ def build_workbook(rows):
                 b64 = item.get("image_base64", "")
                 if b64:
                     try:
-                        buf = resize_b64_image(b64, max_px=IMG_PX)
-                        xl_img = XLImage(buf)
-                        xl_img.width  = IMG_PX
-                        xl_img.height = IMG_PX
-                        offset = pixels_to_EMU(2)
-                        size   = XDRPositiveSize2D(pixels_to_EMU(IMG_PX), pixels_to_EMU(IMG_PX))
-                        marker = AnchorMarker(col=0, colOff=offset, row=row_no-1, rowOff=offset)
-                        xl_img.anchor = OneCellAnchor(_from=marker, ext=size)
-                        ws.add_image(xl_img)
+                        place_image(ws, b64, col_no, row_no, IMG_PX)
                     except Exception:
-                        ws.cell(row=row_no, column=1, value="-")
+                        ws.cell(row=row_no, column=col_no, value="-")
                 else:
-                    ws.cell(row=row_no, column=1, value="-")
+                    ws.cell(row=row_no, column=col_no, value="-")
             else:
-                cell = ws.cell(row=row_no, column=col_no, value=item.get(key, ""))
-                row_style(cell, row_no)
+                val = item.get(key, "")
+                cell = ws.cell(row=row_no, column=col_no, value=val)
+                row_style(cell, idx)
+                if key in totals:
+                    try:
+                        totals[key] += float(val)
+                    except (ValueError, TypeError):
+                        pass
+
+    # Toplam satırı
+    total_row = len(rows) + 2
+    ws.row_dimensions[total_row].height = 24
+    indirim = totals.get("tagPrice", 0) - totals.get("salePrice", 0)
+
+    for col_no, (_, key, _) in enumerate(COLUMNS, start=1):
+        cell = ws.cell(row=total_row, column=col_no)
+        if col_no == 1:
+            cell.value = "TOPLAM"
+            cell.font      = Font(name="Arial", bold=True, size=10, color="FFFFFF")
+            cell.fill      = PatternFill("solid", start_color=DARK)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        elif key == "tagPrice":
+            cell.value = totals["tagPrice"]
+            cell.number_format = '#,##0.00'
+            total_style(cell)
+        elif key == "salePrice":
+            cell.value = totals["salePrice"]
+            cell.number_format = '#,##0.00'
+            total_style(cell)
+        elif key == "discount":
+            cell.value = indirim
+            cell.number_format = '#,##0.00'
+            cell.font  = Font(name="Arial", bold=True, size=10, color="C00000")
+            cell.fill  = PatternFill("solid", start_color="E8ECF4")
+            s = Side(style="medium", color=DARK)
+            cell.border = Border(left=s, right=s, top=s, bottom=s)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        else:
+            total_style(cell)
 
     ws.freeze_panes = "A2"
     last_col = get_column_letter(len(COLUMNS))
     ws.auto_filter.ref = f"A1:{last_col}1"
     return wb
 
-def parse_and_validate(request):
-    body = request.get_json(force=True, silent=True)
+def parse_rows(req):
+    body = req.get_json(force=True, silent=True)
     if not body or "data" not in body:
         return None, None
-    rows = [r for r in body["data"] if any(str(v).strip() for k, v in r.items() if k != "image_base64")]
+    rows = [r for r in body["data"]
+            if any(str(v).strip() for k, v in r.items() if k != "image_base64")]
     return body, rows
 
 
-# ── Mevcut endpoint (FM desktop için — base64 döndürür) ──────────────────────
+# ── FM Pro endpoint (base64 döndürür) ────────────────────────────────────────
 @app.route("/generate-excel", methods=["POST"])
 def generate_excel():
-    body, rows = parse_and_validate(request)
+    ok, err = check_api_key()
+    if not ok:
+        return jsonify({"error": err}), 401
+
+    body, rows = parse_rows(request)
     if body is None:
         return jsonify({"error": "JSON body eksik"}), 400
     if not rows:
         return jsonify({"error": "data listesi bos"}), 400
 
-    wb = build_workbook(rows)
+    wb  = build_workbook(rows)
     out = io.BytesIO()
     wb.save(out)
     out.seek(0)
@@ -135,40 +195,40 @@ def generate_excel():
     return jsonify({"status": "ok", "rows": len(rows), "excel_b64": encoded})
 
 
-# ── Yeni endpoint (WebDirect için — download URL döndürür) ───────────────────
+# ── WebDirect endpoint (download URL döndürür) ───────────────────────────────
 @app.route("/generate-excel-file", methods=["POST"])
 def generate_excel_file():
+    ok, err = check_api_key()
+    if not ok:
+        return jsonify({"error": err}), 401
+
     _cleanup_old_files()
 
-    body, rows = parse_and_validate(request)
+    body, rows = parse_rows(request)
     if body is None:
         return jsonify({"error": "JSON body eksik"}), 400
     if not rows:
         return jsonify({"error": "data listesi bos"}), 400
 
-    wb = build_workbook(rows)
-    
-
-    
+    wb    = build_workbook(rows)
     token = uuid.uuid4().hex[:6]
     tarih = datetime.now().strftime("%Y-%m-%d")
     filename = f"satis_raporu_{tarih}_{token}.xlsx"
-    filepath = os.path.join(TEMP_DIR, filename)
-
+    filepath = os.path.join(TMP_DIR, filename)
     wb.save(filepath)
 
     with _store_lock:
         _file_store[token] = {
-            "path": filepath,
-            "filename": filename,
+            "path":       filepath,
+            "filename":   filename,
             "created_at": time.time()
         }
 
+    base_url = request.host_url.rstrip("/")
     return jsonify({
-        "status": "ok",
-        "rows": len(rows),
-        "download_token": token,
-        "download_url": f"/download/{token}"
+        "status":       "ok",
+        "rows":         len(rows),
+        "download_url": f"{base_url}/download/{token}"
     })
 
 
