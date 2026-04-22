@@ -117,7 +117,6 @@ def parse_and_validate(request):
 
 
 # ── Mevcut endpoint (FM desktop için — base64 döndürür) ──────────────────────
-
 @app.route("/generate-excel", methods=["POST"])
 def generate_excel():
     body, rows = parse_and_validate(request)
@@ -128,7 +127,6 @@ def generate_excel():
 
     try:
         wb = build_workbook(rows)
-        
         out = io.BytesIO()
         wb.save(out)
         out.seek(0)
